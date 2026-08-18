@@ -70,6 +70,11 @@ local function update_vehicle_transform(data)
   local transform = data.transform
   transform.owner = data.vehicle_id
   transform.sent_at = data.sent_at
+  transform.send_timer = data.send_timer
+  transform.ping_ms = data.ping_ms
+  -- Our own latency to the server. Together with the sender's ping_ms this
+  -- covers both legs of the path the packet actually travelled.
+  transform.receiver_ping_ms = network.connection.rtt_smooth_ms or network.connection.ping or 0
 
   local id = vehiclemanager.id_map[transform.owner or -1] or -1
   if vehiclemanager.ownership[id] then return end

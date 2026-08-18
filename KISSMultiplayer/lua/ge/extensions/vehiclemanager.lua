@@ -16,6 +16,7 @@ M.server_ids = {}
 M.ownership = {}
 M.vehicle_updates_buffer = {}
 M.packet_gen_buffer = {}
+M.packet_timer_buffer = {}
 M.is_network_session = false
 M.delay_spawns = false
 M.vehicle_buffer = {}
@@ -366,8 +367,28 @@ local function update_vehicle(data)
   local id = M.id_map[data.vehicle_id]
   if not id then return end
   if M.ownership[id] then return end
-  if data.generation <= (M.packet_gen_buffer[id] or -1) then return end
-  M.packet_gen_buffer[id] = data.generation
+  -- Order by the sender's monotonic timer when it is available. generation is
+  -- only a counter, so it cannot tell a stale packet from a fresh one after
+  -- the sender restarts its stream; the timer can, and it is the same value
+  -- prediction runs on.
+  local send_timer = data.send_timer
+  if send_timer and send_timer > 0 then
+    local previous_timer = M.packet_timer_buffer[id]
+    if previous_timer and send_timer <= previous_timer then
+      -- A small step backwards is a reordered packet. A large one means the
+      -- sender's timer restarted, so accept it and drop the generation
+      -- history that belongs to the previous stream.
+      if (previous_timer - send_timer) < 0.5 then
+        return
+      end
+      M.packet_gen_buffer[id] = nil
+    end
+    M.packet_timer_buffer[id] = send_timer
+  else
+    if data.generation <= (M.packet_gen_buffer[id] or -1) then return end
+    M.packet_gen_buffer[id] = data.generation
+  end
+
   local vehicle = be:getObjectByID(id)
   if not vehicle then return end
 
@@ -394,6 +415,8 @@ local function remove_vehicle(data)
     M.id_map[id] = nil
     M.ownership[local_id] = nil
     M.vehicle_updates_buffer[local_id] = nil
+    M.packet_gen_buffer[local_id] = nil
+    M.packet_timer_buffer[local_id] = nil
     kisstransform.received_transforms[local_id] = nil
     update_ownership_limits()
   else
