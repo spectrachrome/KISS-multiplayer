@@ -1,5 +1,4 @@
 local M = {}
-local parts_config = v.config
 
 local nodes = {}
 local node_by_cid = {}
@@ -8,16 +7,6 @@ local connected_node_set = {}
 local connected_graph = {}
 local parent_node = nil
 local last_damage = 0
-
--- Superseded force-based replay state, still driven by kiss_transforms.lua.
-local legacy_nodes = {}
-local ref_nodes = {}
-local last_node = 1
-local nodes_per_frame = 32
-local node_pos_thresh = 3
-local node_pos_thresh_sqr = node_pos_thresh * node_pos_thresh
-
-M.test_quat = quat(0.707, 0, 0, 0.707)
 
 -- Mass-weighted centre of gravity in body frame. Published pose and twist are
 -- anchored here rather than at the refnode: the refnode sits wherever the jbeam
@@ -310,29 +299,6 @@ local function onExtensionLoaded()
   choose_parent_node()
   rebuild_connected_nodes()
   compute_sync_cog_body()
-
-  -- Superseded force-based replay state.
-  local force = obj:getPhysicsFPS()
-  local ref = {
-    v.data.refNodes[0].left,
-    v.data.refNodes[0].up,
-    v.data.refNodes[0].back,
-    v.data.refNodes[0].ref,
-  }
-  local total_mass = 0
-  local inverse_rot = quat(obj:getRotation()):inversed()
-  for _, node in pairs(v.data.nodes) do
-    local node_mass = obj:getNodeMass(node.cid)
-    local node_pos = inverse_rot * obj:getNodePosition(node.cid)
-    table.insert(legacy_nodes, {node.cid, node_mass * force, true, node_pos})
-    total_mass = total_mass + node_mass
-  end
-  for _, node in pairs(ref) do
-    table.insert(
-      ref_nodes,
-      {node, total_mass * force / 4, true, inverse_rot * obj:getNodePosition(node)}
-    )
-  end
 end
 
 local function onReset()
@@ -349,21 +315,6 @@ local function post_owner_teleport_settle()
   reset_send_smoothers()
   last_cog_compute_time = -math.huge
   compute_sync_cog_body()
-end
-
-  -- NOTE:
-  -- This is a temperary solution. It's not great. We made it to release the mod.
-  -- A better solution will be used in future versions
-local function update_eligible_nodes()
-  local inverse_rot =  quat(obj:getRotation()):inversed()
-  for k=last_node, math.min(#legacy_nodes , last_node + nodes_per_frame) do
-    local node = legacy_nodes[k]
-    local local_node_pos = inverse_rot * obj:getNodePosition(node[1])
-    local local_original_pos = node[4]
-    node[3] = (local_node_pos - local_original_pos):squaredLength() < node_pos_thresh_sqr
-    last_node = k
-  end
-  if last_node == #legacy_nodes then last_node = 1 end
 end
 
 local function update_transform_info(_we_own_this_vehicle)
@@ -400,36 +351,6 @@ local function update_transform_info(_we_own_this_vehicle)
   obj:queueGameEngineLua("kisstransform.push_transform("..obj:getID()..", " .. string.format("%q", jsonEncode(transform)) .. ")")
 end
 
-local function apply_linear_velocity(x, y, z)
-  local velocity = vec3(x, y, z)
-  local force = float3(0, 0, 0)
-  for k=1, #legacy_nodes do
-    local node = legacy_nodes[k]
-    if node[3] then
-      local result = velocity * node[2]
-      force:set(result.x, result.y, result.z)
-      obj:applyForceVector(node[1], force)
-    end
-  end
-end
-
-local function apply_linear_velocity_ang_torque(x, y, z, pitch, roll, yaw)
-  local velocity = vec3(x, y, z)
-  local nodes = legacy_nodes
-  local rot = vec3(pitch, roll, yaw):rotated(quat(obj:getRotation()))
-  local node_position = vec3()
-  local force = float3(0, 0, 0)
-  for k=1, #nodes do
-    local node = nodes[k]
-    if node[3] then
-      node_position:set(obj:getNodePosition(node[1]))
-      local result = (velocity + node_position:cross(rot)) * node[2]
-      force:set(result.x, result.y, result.z)
-      obj:applyForceVector(node[1], force)
-    end
-  end
-end
-
 local function send_vehicle_config()
   local r = quatFromDir(-vec3(obj:getDirectionVector()), vec3(obj:getDirectionVectorUp()))
   local p = obj:getPosition()
@@ -451,9 +372,5 @@ M.onExtensionLoaded = onExtensionLoaded
 M.onReset = onReset
 M.post_owner_teleport_settle = post_owner_teleport_settle
 M.send_vehicle_config = send_vehicle_config
-
-M.apply_linear_velocity_ang_torque = apply_linear_velocity_ang_torque
-M.update_eligible_nodes = update_eligible_nodes
-M.apply_linear_velocity = apply_linear_velocity
 
 return M

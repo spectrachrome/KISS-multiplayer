@@ -450,14 +450,6 @@ local function onUpdate(dt)
     end
   end
 
-  for k, v in pairs(M.id_map) do
-    if not M.ownership[v] then
-      local vehicle = be:getObjectByID(v)
-      if vehicle and (not kisstransform.inactive[v]) then
-        vehicle:queueLuaCommand("kiss_vehicle.update_eligible_nodes()")
-      end
-    end
-  end
   if not (M.loading_map or M.delay_spawns) then
     local to_remove = {}
     for k, vehicle in pairs(M.vehicle_buffer) do
