@@ -8,6 +8,7 @@ local meta_timer = 0
 local colors_buffer = {}
 local plates_buffer = {}
 local first_vehicle = true
+local last_bad_packet_log = {}      -- vehicle_id -> last timestamp we warned about NaN/Inf (throttle)
 
 M.loading_map = false
 M.id_map = {}
@@ -53,31 +54,77 @@ local function colors_eq(a, b)
   return color_eq(a[1], b[1]) and color_eq(a[2], b[2]) and color_eq(a[3], b[3])
 end
 
+-- Velocities below this magnitude (m/s) are published as exactly zero. A parked
+-- soft body never settles to a true zero velocity, and that residue is what the
+-- receiver's prediction integrates into visible creep and bobbing while the
+-- owner is standing still.
+local SEND_LINEAR_DEADBAND = 0.05
+
+local function zero_small_vec_components(x, y, z, deadband)
+  if math.sqrt(x * x + y * y + z * z) < deadband then
+    return 0, 0, 0
+  end
+  return x, y, z
+end
+
 local function send_vehicle_update(obj)
   if not kisstransform.local_transforms[obj:getID()] then return end
   local t = kisstransform.local_transforms[obj:getID()]
   if not t.input then return end
   if not t.gearbox then return end
+  if not t.position or not t.rotation or not t.velocity or not t.angular_velocity then return end
   local rotation = t.rotation
   if obj:getJBeamFilename() == "unicycle" then
     local q = quat(getCameraQuat()):toEulerYXZ()
     local q = quatFromEuler(0.0, 0.0, q.x)
     rotation = {q.x, q.y, q.z, q.w}
   end
-  local position = obj:getPosition()
-  local velocity = obj:getVelocity()
+  -- Everything here comes from the physics-step sample in kiss_vehicle, not
+  -- from a fresh read: re-reading position and velocity on the graphics frame
+  -- would pair a fresh pose with a stale rotation and a stale send_timer.
+  local position = t.position
+  local velocity = t.velocity
+  local velocity_x, velocity_y, velocity_z = zero_small_vec_components(velocity[1], velocity[2], velocity[3], SEND_LINEAR_DEADBAND)
+  local angular_velocity = t.angular_velocity
+
+  -- Finite-number sanity check. If physics on this client blows up (NaN /
+  -- Inf in position / velocity / rotation), dropping the packet is the
+  -- right call — sending garbage triggers serde errors on the Rust side
+  -- and corrupts remote-client state. Per-vehicle throttled log so a
+  -- persistent blow-up doesn't spam the console.
+  local function ok(n)
+    return type(n) == "number" and n == n and n < 1e8 and n > -1e8
+  end
+  if not (ok(position[1]) and ok(position[2]) and ok(position[3])
+      and ok(velocity_x) and ok(velocity_y) and ok(velocity_z)
+      and ok(rotation[1]) and ok(rotation[2]) and ok(rotation[3]) and ok(rotation[4])
+      and ok(angular_velocity[1]) and ok(angular_velocity[2]) and ok(angular_velocity[3])) then
+    local vid = obj:getID()
+    if not last_bad_packet_log[vid] or (get_current_time() - last_bad_packet_log[vid]) > 5 then
+      print(string.format("[vehiclemanager] non-finite values in vehicle %d transform; dropping packet", vid))
+      last_bad_packet_log[vid] = get_current_time()
+    end
+    return
+  end
+
   local result = {
     transform = {
-      position = {position.x, position.y, position.z},
+      position = {position[1], position[2], position[3]},
       rotation = rotation,
-      velocity = {velocity.x, velocity.y, velocity.z},
-      angular_velocity = {t.vel_pitch, t.vel_roll, t.vel_yaw}
+      velocity = {velocity_x, velocity_y, velocity_z},
+      angular_velocity = {angular_velocity[1], angular_velocity[2], angular_velocity[3]}
     },
     electrics = t.input,
     gearbox = t.gearbox,
     vehicle_id = obj:getID(),
     generation = generation,
-    sent_at = get_current_time()
+    sent_at = get_current_time(),
+    -- Sender-monotonic timer for receiver-side prediction. sent_at stays for
+    -- compatibility with older consumers.
+    send_timer = t.send_timer or 0,
+    -- Our own latency to the server plus the age of the sample itself, which
+    -- is the part of the delay the receiver has no other way to see.
+    ping_ms = (network.connection.rtt_smooth_ms or network.connection.ping or 0) + ((t.send_dt or 0) * 1000),
   }
   generation = generation + 1
   network.send_data(
@@ -145,7 +192,7 @@ end
 local function send_vehicle_config(vehicle_id)
   local vehicle = be:getObjectByID(vehicle_id)
   if vehicle then
-    vehicle:queueLuaCommand("kiss_vehicle.send_vehicle_config()")
+    kisstransform.queue_kiss_command(vehicle, "kiss_vehicle.send_vehicle_config()")
   end
 end
 
@@ -276,7 +323,7 @@ local function onUpdate(dt)
       local vehicle = be:getObjectByID(i)
       if vehicle and (not kisstransform.inactive[i]) then
         send_vehicle_update(vehicle)
-        vehicle:queueLuaCommand("kiss_electrics.send()")
+        kisstransform.queue_kiss_command(vehicle, "kiss_electrics.send()")
       end
     end
   end
@@ -326,8 +373,8 @@ local function update_vehicle(data)
 
   kisstransform.update_vehicle_transform(data)
   if not kisstransform.inactive[id] then
-    vehicle:queueLuaCommand("kiss_input.apply(" .. string.format("%q", jsonEncode(data.electrics)) .. ")")
-    vehicle:queueLuaCommand("kiss_gearbox.apply(" .. string.format("%q", jsonEncode(data.gearbox)) .. ")")
+    kisstransform.queue_kiss_command(vehicle, "kiss_input.apply(" .. string.format("%q", jsonEncode(data.electrics)) .. ")")
+    kisstransform.queue_kiss_command(vehicle, "kiss_gearbox.apply(" .. string.format("%q", jsonEncode(data.gearbox)) .. ")")
   end
 end
 
@@ -415,7 +462,7 @@ local function electrics_diff_update(data)
     local vehicle = be:getObjectByID(id)
     if not vehicle then return end
     local data = jsonEncode(data[2].diff)
-    vehicle:queueLuaCommand("kiss_electrics.apply_diff(" .. string.format("%q", data) .. ")")
+    kisstransform.queue_kiss_command(vehicle, "kiss_electrics.apply_diff(" .. string.format("%q", data) .. ")")
   end
 end
 
@@ -457,7 +504,7 @@ local function attach_coupler(data)
     local node_b_pos = vec3(vehicle_b:getPosition()) + vec3(vehicle_b:getNodePosition(data.node_b_id))
     local pos = vec3(vehicle_b:getPosition()) + (node_a_pos - node_b_pos)
     vehicle_b:setPositionNoPhysicsReset(Point3F(pos.x, pos.y, pos.z))
-    vehicle_b:queueLuaCommand("kiss_couplers.attach_coupler("..data.node_b_id..")")
+    kisstransform.queue_kiss_command(vehicle_b, "kiss_couplers.attach_coupler("..data.node_b_id..")")
     onCouplerAttached(obj_a, obj_b, data.node_a_id, data.node_b_id)
   end
 end
@@ -472,7 +519,7 @@ local function detach_coupler(data)
     if not vehicle then return end
     if not vehicle_b then return end
     if vehicle_ ~= vehicle_b and vec3(vehicle:getPosition()):distance(vec3(vehicle_b:getPosition())) > 15 then return end
-    vehicle:queueLuaCommand("kiss_couplers.detach_coupler("..data.node_a_id..")")
+    kisstransform.queue_kiss_command(vehicle, "kiss_couplers.detach_coupler("..data.node_a_id..")")
     onCouplerDetached(obj_a, obj_b, data.node_a_id, data.node_b_id)
     onCouplerDetach(obj_a, data.node_a_id)
     onCouplerDetach(obj_b, data.node_b_id)

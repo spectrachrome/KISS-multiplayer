@@ -15,13 +15,30 @@ M.velocity_error_limit = 10
 
 M.hidden = {}
 
+-- BeamNG auto-loads lua/vehicle/extensions/*.lua but does not recurse into
+-- subfolders. The kiss_mp/* extensions need an explicit addModulePath +
+-- loadModulesInDirectory call to become available in vehicle Lua. Prepended
+-- to every queueLuaCommand into a kiss_mp/* module so the call is self-healing
+-- if the vehicle Lua context ever resets.
+local VEHICLE_SYNC_BOOTSTRAP = "extensions.addModulePath('lua/vehicle/extensions/kiss_mp'); extensions.loadModulesInDirectory('lua/vehicle/extensions/kiss_mp'); "
+
+local function queue_kiss_command(vehicle, command)
+  if not vehicle then return end
+  vehicle:queueLuaCommand(VEHICLE_SYNC_BOOTSTRAP .. command)
+end
+
 local function update(dt)
   if not network.connection.connected then return end
-    -- Get rotation/angular velocity from vehicle lua
+
+  -- Refresh each vehicle's local transform cache. Only owned vehicles send
+  -- this cache over the network, but remote vehicles still need their vehicle
+  -- Lua modules loaded before receiver-side correction runs.
   for i = 0, be:getObjectCount() do
     local vehicle = be:getObject(i)
-    if vehicle and (not M.inactive[vehicle:getID()]) then
-      vehicle:queueLuaCommand("kiss_vehicle.update_transform_info()")
+    local vid = vehicle and vehicle:getID()
+    if vehicle and (not M.inactive[vid]) then
+      local owned = vehiclemanager.ownership[vid] ~= nil
+      queue_kiss_command(vehicle, "kiss_vehicle.update_transform_info(" .. tostring(owned) .. ")")
     end
   end
 
@@ -74,6 +91,7 @@ M.send_transform_updates = send_transform_updates
 M.send_vehicle_transform = send_vehicle_transform
 M.update_vehicle_transform = update_vehicle_transform
 M.push_transform = push_transform
+M.queue_kiss_command = queue_kiss_command
 M.onUpdate = update
 
 return M
