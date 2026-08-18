@@ -557,6 +557,8 @@ impl Server {
                             vehicle_id: vehicle_id.clone(),
                             generation: self.tick,
                             sent_at: 0.0,
+                            send_timer: None,
+                            ping_ms: None,
                         }))
                         .await;
                 }

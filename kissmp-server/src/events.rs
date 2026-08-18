@@ -227,11 +227,15 @@ impl Server {
                     }
                     Ping(ping) => {
                         let connection = self.connections.get_mut(&client_id).unwrap();
-                        connection.client_info_public.ping = ping as u32;
+                        connection.client_info_public.ping = ping.reported_ping_ms as u32;
                         let start = std::time::SystemTime::now();
                         let since_the_epoch = start.duration_since(std::time::UNIX_EPOCH).unwrap();
                         let data = bincode::serialize(&shared::ServerCommand::Pong(
-                            since_the_epoch.as_secs_f64(),
+                            shared::PongData {
+                                seq: ping.seq,
+                                client_send_time: ping.client_send_time,
+                                server_send_time: since_the_epoch.as_secs_f64(),
+                            },
                         ))
                         .unwrap();
                         let _ = connection.conn.send_datagram(data.into());

@@ -63,6 +63,29 @@ impl ClientInfoPublic {
     }
 }
 
+/// Client -> server ping. Sequence-numbered so a late or duplicated pong can be
+/// discarded instead of producing a bogus round-trip sample, and carrying the
+/// client's own send time so the round trip is measured against the exact ping
+/// it answers rather than against "the last ping we sent".
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PingData {
+    pub seq: u32,
+    pub client_send_time: f64,
+    /// Client's current smoothed RTT estimate in milliseconds, for the server's
+    /// player list. The server does not measure this itself.
+    pub reported_ping_ms: u16,
+}
+
+/// Server -> client pong. Echoes the ping's sequence and client send time so
+/// the client can pair them up, and adds the server's send time for clock
+/// offset estimation.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PongData {
+    pub seq: u32,
+    pub client_send_time: f64,
+    pub server_send_time: f64,
+}
+
 impl Default for ClientInfoPublic {
     fn default() -> Self {
         Self {
@@ -102,7 +125,7 @@ pub enum ClientCommand {
         total_chunks: u32,
         data: String,
     },
-    Ping(u16),
+    Ping(PingData),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -124,7 +147,7 @@ pub enum ServerCommand {
     ServerInfo(ServerInfo),
     FilePart(String, Vec<u8>, u32, u32, u32),
     VoiceChatPacket(u32, [f32; 3], Vec<u8>),
-    Pong(f64),
+    Pong(PongData),
 
     // public server commands
     VehicleSetPosition(u32, [f32; 3]),

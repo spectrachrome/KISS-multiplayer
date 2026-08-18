@@ -13,7 +13,17 @@ local current_download = nil
 
 local socket = require("socket")
 local messagepack = require("lua/common/libs/Lua-MessagePack/MessagePack")
-local ping_send_time = 0
+local ping_seq = 0
+local pending_pings = {}
+local last_pong_seq = 0
+-- Exponential smoothing factor for the round-trip estimate. 0.15 per pong at
+-- the 1 Hz heartbeat rate settles in a few seconds while still rejecting the
+-- single-packet spikes that would otherwise show up directly in the prediction
+-- horizon on every receiving client.
+local RTT_ALPHA = 0.15
+-- Round trips longer than this are treated as a lost pong rather than a real
+-- sample; a stalled packet would otherwise poison the smoothed estimate.
+local MAX_RTT_SAMPLE_S = 1.0
 
 M.players = {}
 M.socket = socket
@@ -27,7 +37,10 @@ M.connection = {
   tickrate = 33,
   mods_left = 0,
   ping = 0,
-  time_offset = 0
+  time_offset = 0,
+  -- Smoothed round-trip time in milliseconds. This, not the raw `ping`, is what
+  -- the sync path puts on the wire and uses for latency compensation.
+  rtt_smooth_ms = 0,
 }
 
 local FILE_TRANSFER_CHUNK_SIZE = 16384;
@@ -75,6 +88,12 @@ local function disconnect(data)
   kissui.chat.add_message(text)
   M.connection.connected = false
   M.connection.tcp:close()
+  pending_pings = {}
+  ping_seq = 0
+  last_pong_seq = 0
+  M.connection.ping = 0
+  M.connection.time_offset = 0
+  M.connection.rtt_smooth_ms = 0
   M.players = {}
   kissplayers.players = {}
   kissplayers.player_transforms = {}
@@ -156,13 +175,30 @@ local function handle_vehicle_lua(data)
 end
 
 local function handle_pong(data)
-  local server_time = data
   local local_time = socket.gettime()
-  local ping = local_time - ping_send_time
-  if ping > 1 then return end
-  local time_diff = server_time - local_time + (ping / 2)
+  if not data or not data.seq then return end
+  -- Datagrams can arrive out of order or duplicated. Measuring against the
+  -- matching ping's own send time (rather than "the last ping we sent")
+  -- keeps a reordered pong from reporting a near-zero round trip.
+  if data.seq <= last_pong_seq then return end
+
+  local sent = pending_pings[data.seq]
+  pending_pings[data.seq] = nil
+  if not sent then return end
+
+  local ping = local_time - (data.client_send_time or sent.client_send_time or local_time)
+  if ping <= 0 or ping > MAX_RTT_SAMPLE_S then return end
+
+  last_pong_seq = data.seq
+  local previous_smooth_s = (M.connection.rtt_smooth_ms or 0) * 0.001
+  local smooth_s = previous_smooth_s > 0
+    and (previous_smooth_s + (ping - previous_smooth_s) * RTT_ALPHA)
+    or ping
+
+  local time_diff = (data.server_send_time or local_time) - local_time + (ping * 0.5)
   M.connection.time_offset = time_offset_smoother.get(time_diff)
   M.connection.ping = ping * 1000
+  M.connection.rtt_smooth_ms = smooth_s * 1000
 end
 
 local function handle_player_disconnected(data)
@@ -395,10 +431,25 @@ local function on_finished_download()
 end
 
 local function send_ping()
-  ping_send_time = socket.gettime()
+  local now = socket.gettime()
+  ping_seq = ping_seq + 1
+  -- Drop pings whose pong can no longer produce a usable sample, so a lossy
+  -- link doesn't grow this table without bound.
+  for seq, sample in pairs(pending_pings) do
+    if (now - (sample.client_send_time or now)) > MAX_RTT_SAMPLE_S then
+      pending_pings[seq] = nil
+    end
+  end
+  pending_pings[ping_seq] = {
+    client_send_time = now,
+  }
   send_data(
     {
-      Ping = math.floor(M.connection.ping),
+      Ping = {
+        seq = ping_seq,
+        client_send_time = now,
+        reported_ping_ms = math.floor(M.connection.rtt_smooth_ms or M.connection.ping or 0),
+      },
     },
     false
   )

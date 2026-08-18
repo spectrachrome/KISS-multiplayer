@@ -32,15 +32,32 @@ pub struct VehicleData {
     pub rotation: [f32; 4],
 }
 
-// A single packet that contains all of the vehicle updates.
+/// A single packet that contains all state for one vehicle update.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VehicleUpdate {
+    /// Pose and twist of the sender's centre of gravity.
     pub transform: Transform,
+    /// Control inputs, replayed on the receiver.
     pub electrics: Electrics,
     pub gearbox: Gearbox,
+    /// Unique vehicle ID on the server.
     pub vehicle_id: u32,
+    /// Monotonically increasing counter, used to drop out-of-order packets when
+    /// `send_timer` is unavailable.
     pub generation: u64,
+    /// Sender wall-clock timestamp in seconds. Subject to cross-machine clock
+    /// skew, which is why prediction prefers `send_timer`.
     pub sent_at: f64,
+    /// Sender-side monotonic vehicle timer, in seconds, sampled at the physics
+    /// step the transform was taken from. The receiver dead-reckons forward
+    /// from this, so it must come from the same clock domain as the sample.
+    /// Optional for backward compatibility with older Lua clients.
+    pub send_timer: Option<f64>,
+    /// Sender-side latency estimate in milliseconds: its smoothed RTT to the
+    /// server plus the age of its own transform sample. The receiver halves
+    /// this to estimate one-way sender-to-server delay.
+    /// Optional for backward compatibility with older Lua clients.
+    pub ping_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
