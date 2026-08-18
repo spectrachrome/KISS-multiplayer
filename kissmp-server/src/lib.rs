@@ -543,27 +543,6 @@ impl Server {
 
     async fn tick(&mut self) {
         self.tick += 1;
-        for (_, client) in &mut self.connections {
-            for (vehicle_id, vehicle) in &self.vehicles {
-                if let (Some(transform), Some(electrics), Some(gearbox)) =
-                    (&vehicle.transform, &vehicle.electrics, &vehicle.gearbox)
-                {
-                    let _ = client
-                        .unreliable
-                        .send(ServerCommand::VehicleUpdate(VehicleUpdate {
-                            transform: transform.clone(),
-                            electrics: electrics.clone(),
-                            gearbox: gearbox.clone(),
-                            vehicle_id: vehicle_id.clone(),
-                            generation: self.tick,
-                            sent_at: 0.0,
-                            send_timer: None,
-                            ping_ms: None,
-                        }))
-                        .await;
-                }
-            }
-        }
         self.lua_tick().await.unwrap();
     }
 
