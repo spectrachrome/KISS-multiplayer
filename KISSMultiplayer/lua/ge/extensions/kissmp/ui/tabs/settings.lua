@@ -1,7 +1,20 @@
 local M = {}
 local imgui = ui_imgui
 
+-- A/B TEST SCAFFOLDING (not for upstream).
+local legacy_sync = imgui.BoolPtr(false)
+
 local function draw()
+  imgui.Separator()
+  imgui.Text("Sync path (testing)")
+  if imgui.Checkbox("Use legacy force-based sync", legacy_sync) then
+    kisstransform.set_legacy_sync(legacy_sync[0])
+  end
+  imgui.PushTextWrapPos(0)
+  imgui.Text("Off = COG motion sync with dead-reckoning and PD correction. On = the old per-node force replay. Both clients must be set the same way, or the two ends will disagree about what the packet's position means.")
+  imgui.PopTextWrapPos()
+  imgui.Separator()
+
   if imgui.Checkbox("Show Name Tags", kissui.show_nametags) then
     kissconfig.save_config()
   end

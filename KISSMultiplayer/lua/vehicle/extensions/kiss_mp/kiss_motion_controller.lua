@@ -9,6 +9,10 @@
 local M = {}
 
 M.cooldown_timer = 2
+-- A/B TEST SCAFFOLDING (not for upstream): cleared by the GE side when the
+-- session is switched to the legacy force-based path, so the two correction
+-- loops never run against the same body.
+M.enabled = true
 M.sync_id = nil
 M.ownership = true
 M.ownership_known = false
@@ -267,6 +271,7 @@ local function try_rude(target_cog_position, target_rotation, target_cog_velocit
 end
 
 local function update(dt)
+  if not M.enabled then return end
   if not M.ownership_known or M.ownership then
     return
   end
@@ -529,6 +534,15 @@ local function onReset()
   M.last_body_angular_velocity = nil
 end
 
+-- A/B TEST SCAFFOLDING (not for upstream).
+local function set_enabled(enabled)
+  M.enabled = enabled and true or false
+  if not M.enabled then
+    clear_drift_state()
+  end
+end
+
+M.set_enabled = set_enabled
 M.set_target_transform = set_target_transform
 M.snap_to_cog_target = snap_to_cog_target
 M.post_teleport_cooldown = post_teleport_cooldown

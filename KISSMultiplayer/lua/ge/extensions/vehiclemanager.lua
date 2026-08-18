@@ -118,11 +118,28 @@ local function send_vehicle_update(obj)
   -- Everything here comes from the physics-step sample in kiss_vehicle, not
   -- from a fresh read: re-reading position and velocity on the graphics frame
   -- would pair a fresh pose with a stale rotation and a stale send_timer.
-  local position = t.position
+  -- A/B TEST SCAFFOLDING (not for upstream): in legacy mode the packet carries
+  -- the refnode-anchored pose and raw gyro, with no deadband, exactly as the
+  -- old path published it.
+  local legacy = kisstransform.legacy_sync
+  local position = legacy and (t.legacy_position or t.position) or t.position
   local position_vec = vec3(position[1], position[2], position[3])
-  local velocity = t.velocity
-  local velocity_x, velocity_y, velocity_z = zero_small_vec_components(velocity[1], velocity[2], velocity[3], SEND_LINEAR_DEADBAND)
+  local velocity = legacy and (t.legacy_velocity or t.velocity) or t.velocity
+  local velocity_x, velocity_y, velocity_z
+  if legacy then
+    velocity_x, velocity_y, velocity_z = velocity[1], velocity[2], velocity[3]
+  else
+    velocity_x, velocity_y, velocity_z = zero_small_vec_components(velocity[1], velocity[2], velocity[3], SEND_LINEAR_DEADBAND)
+  end
   local angular_velocity = t.angular_velocity
+  if legacy then
+    -- Leave the unicycle's camera-derived rotation alone; it was special-cased
+    -- on both paths.
+    if obj:getJBeamFilename() ~= "unicycle" then
+      rotation = t.legacy_rotation or rotation
+    end
+    angular_velocity = {t.vel_pitch or 0, t.vel_roll or 0, t.vel_yaw or 0}
+  end
 
   -- A position jump greater than TELEPORT_THRESHOLD in one tick is treated as a
   -- teleport. Arm a debounced ResetVehicle so the remote replica resets at the
@@ -450,6 +467,18 @@ local function onUpdate(dt)
     end
   end
 
+  -- A/B TEST SCAFFOLDING (not for upstream): only the legacy path consumes the
+  -- per-node eligibility sweep.
+  if kisstransform.legacy_sync then
+    for k, v in pairs(M.id_map) do
+      if not M.ownership[v] then
+        local vehicle = be:getObjectByID(v)
+        if vehicle and (not kisstransform.inactive[v]) then
+          vehicle:queueLuaCommand("kiss_vehicle.update_eligible_nodes()")
+        end
+      end
+    end
+  end
   if not (M.loading_map or M.delay_spawns) then
     local to_remove = {}
     for k, vehicle in pairs(M.vehicle_buffer) do

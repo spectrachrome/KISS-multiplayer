@@ -16,6 +16,35 @@ M.velocity_error_limit = 10
 
 M.hidden = {}
 
+-- A/B TEST SCAFFOLDING (not for upstream).
+--
+-- One wholesale switch between the superseded force-based replay and the
+-- motion sync, decided here and pushed to vehicle Lua on change. Never gate
+-- individual functions on this: the two paths disagree about what the wire
+-- means (refnode pose vs COG pose), so a half-switched session is not a
+-- meaningful comparison of either.
+--
+-- Both clients must be on the same setting for the A/B to mean anything.
+M.legacy_sync = false
+
+local function push_sync_mode()
+  for i = 0, be:getObjectCount() do
+    local vehicle = be:getObject(i)
+    if vehicle then
+      vehicle:queueLuaCommand(
+        "extensions.addModulePath('lua/vehicle/extensions/kiss_mp'); "
+        .. "extensions.loadModulesInDirectory('lua/vehicle/extensions/kiss_mp'); "
+        .. "kiss_motion_controller.set_enabled(" .. tostring(not M.legacy_sync) .. ")"
+      )
+    end
+  end
+end
+
+local function set_legacy_sync(enabled)
+  M.legacy_sync = enabled and true or false
+  push_sync_mode()
+end
+
 -- BeamNG auto-loads lua/vehicle/extensions/*.lua but does not recurse into
 -- subfolders. The kiss_mp/* extensions need an explicit addModulePath +
 -- loadModulesInDirectory call to become available in vehicle Lua. Prepended
@@ -128,10 +157,19 @@ local function update(dt)
           -- Reactivated replicas can be far from the authority because
           -- setActive(0) freezes local physics. Snap once, then resume the
           -- normal per-frame correction path.
-          queue_cog_snap(vehicle, transform)
+          if not M.legacy_sync then
+            queue_cog_snap(vehicle, transform)
+          end
         end
-        -- Per-frame correction runs from kiss_motion_controller.updateGFX
-        -- inside vehicle Lua. GE only handles activity/view-distance here.
+        if M.legacy_sync then
+          -- Legacy path: GE drives the correction per frame, on the packet's
+          -- own refnode-anchored pose.
+          vehicle:queueLuaCommand("kiss_transforms.set_target_transform(" .. string.format("%q", jsonEncode(transform)) .. ")")
+          vehicle:queueLuaCommand("kiss_transforms.update("..dt..")")
+        end
+        -- Otherwise per-frame correction runs from
+        -- kiss_motion_controller.updateGFX inside vehicle Lua, and GE only
+        -- handles activity/view-distance here.
       end
     end
   end
@@ -166,10 +204,15 @@ local function update_vehicle_transform(data)
 
   local vehicle = be:getObjectByID(id)
   if vehicle and (not M.inactive[id]) then
-    -- Packet arrival hands the new authoritative COG pose to kiss_sync.
-    -- Application happens per-frame from kiss_motion_controller.update(dt),
-    -- not on packet arrival.
-    queue_kiss_command(vehicle, "kiss_motion_controller.set_target_transform(" .. string.format("%q", jsonEncode(transform)) .. ")")
+    if M.legacy_sync then
+      transform.time_past = clamp(vehiclemanager.get_current_time() - transform.sent_at, 0, 0.1) * 0.9 + 0.001
+      vehicle:queueLuaCommand("kiss_transforms.set_target_transform(" .. string.format("%q", jsonEncode(transform)) .. ")")
+    else
+      -- Packet arrival hands the new authoritative COG pose to kiss_sync.
+      -- Application happens per-frame from kiss_motion_controller.update(dt),
+      -- not on packet arrival.
+      queue_kiss_command(vehicle, "kiss_motion_controller.set_target_transform(" .. string.format("%q", jsonEncode(transform)) .. ")")
+    end
   end
 end
 
@@ -188,6 +231,8 @@ M.push_transform = push_transform
 M.queue_kiss_command = queue_kiss_command
 M.queue_cog_snap = queue_cog_snap
 M.set_teleport_cooldown = set_teleport_cooldown
+M.set_legacy_sync = set_legacy_sync
+M.push_sync_mode = push_sync_mode
 M.apply_motion_target = apply_motion_target
 M.onUpdate = update
 
