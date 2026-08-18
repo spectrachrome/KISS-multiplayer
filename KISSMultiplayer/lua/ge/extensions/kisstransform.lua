@@ -8,6 +8,7 @@ M.received_transforms = {}
 M.local_transforms = {}
 M.raw_positions = {}
 M.inactive = {}
+M.teleport_cooldowns = {}
 
 M.threshold = 3
 M.rot_threshold = 2.5
@@ -72,6 +73,15 @@ end
 local function update(dt)
   if not network.connection.connected then return end
 
+  for id, remaining in pairs(M.teleport_cooldowns) do
+    remaining = remaining - dt
+    if remaining <= 0 then
+      M.teleport_cooldowns[id] = nil
+    else
+      M.teleport_cooldowns[id] = remaining
+    end
+  end
+
   -- Refresh each vehicle's local transform cache. Only owned vehicles send
   -- this cache over the network, but remote vehicles still need their vehicle
   -- Lua modules loaded before receiver-side correction runs.
@@ -87,10 +97,25 @@ local function update(dt)
   -- Don't apply velocity while paused. If we do, velocity gets stored up and released when the game resumes.
   local apply_velocity = not bullettime.getPause()
   for id, transform in pairs(M.received_transforms) do
-    --apply_transform(dt, id, transform, apply_velocity)
     local vehicle = be:getObjectByID(id)
     local p = vec3(transform.position)
-    if vehicle and apply_velocity and (not vehiclemanager.ownership[id]) then
+    local teleport_cooldown = M.teleport_cooldowns[id]
+
+    if not vehicle then
+      -- Nothing to drive.
+    elseif teleport_cooldown and teleport_cooldown > 0 then
+      -- Freeze the replica while the owner's physics settle at the new
+      -- location. Correcting toward a stream that is mid-teleport would drag
+      -- the body across the map.
+      if not M.inactive[id] then
+        vehicle:setActive(0)
+        M.inactive[id] = true
+      end
+    elseif not apply_velocity then
+      -- Paused.
+    elseif vehiclemanager.ownership[id] then
+      -- We own it; nothing to replay.
+    else
       if ((p:distance(vec3(getCameraPosition())) > kissui.view_distance[0])) and kissui.enable_view_distance[0] then
         if (not M.inactive[id]) then
           vehicle:setActive(0)
@@ -122,6 +147,18 @@ local function update_vehicle_transform(data)
   -- covers both legs of the path the packet actually travelled.
   transform.receiver_ping_ms = network.connection.rtt_smooth_ms or network.connection.ping or 0
 
+  -- Normalize the quaternion in place so all downstream consumers see a unit
+  -- quaternion. f32 transport plus the sender's own construction leave it
+  -- slightly off unit, and both the slerp in kiss_sync and the Euler
+  -- conversions in the correction loop assume unit length.
+  local r = transform.rotation
+  if r and #r >= 4 then
+    local n = math.sqrt(r[1]*r[1] + r[2]*r[2] + r[3]*r[3] + r[4]*r[4])
+    if n > 1e-9 then
+      r[1], r[2], r[3], r[4] = r[1]/n, r[2]/n, r[3]/n, r[4]/n
+    end
+  end
+
   local id = vehiclemanager.id_map[transform.owner or -1] or -1
   if vehiclemanager.ownership[id] then return end
   M.raw_positions[transform.owner or -1] = transform.position
@@ -140,12 +177,17 @@ local function push_transform(id, t)
   M.local_transforms[id] = jsonDecode(t)
 end
 
+local function set_teleport_cooldown(vehicle_id, duration)
+  M.teleport_cooldowns[vehicle_id] = math.max(duration or 0.35, 0)
+end
+
 M.send_transform_updates = send_transform_updates
 M.send_vehicle_transform = send_vehicle_transform
 M.update_vehicle_transform = update_vehicle_transform
 M.push_transform = push_transform
 M.queue_kiss_command = queue_kiss_command
 M.queue_cog_snap = queue_cog_snap
+M.set_teleport_cooldown = set_teleport_cooldown
 M.apply_motion_target = apply_motion_target
 M.onUpdate = update
 

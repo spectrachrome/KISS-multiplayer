@@ -8,7 +8,25 @@ local meta_timer = 0
 local colors_buffer = {}
 local plates_buffer = {}
 local first_vehicle = true
+local pending_initial_vehicle_sync = false
+local initial_vehicle_sync_timer = 0
+local last_position_buffer = {}     -- Track last positions for teleport detection
+local teleport_reset_timers = {}    -- vehicle_id -> seconds remaining until reset is sent
+local owner_teleport_cooldowns = {} -- vehicle_id -> seconds remaining before owner physics resumes
 local last_bad_packet_log = {}      -- vehicle_id -> last timestamp we warned about NaN/Inf (throttle)
+-- Metres. A single-tick position jump this large is not motion, it is a
+-- teleport: recovery, respawn, or the map placing the vehicle. Well above
+-- anything reachable at any speed within one network tick.
+local TELEPORT_THRESHOLD = 200.0
+-- Seconds to let the owner's physics settle at the new location before telling
+-- remotes to reset there. Sending immediately would broadcast a pose captured
+-- mid-teleport, while the body is still resolving into place.
+local TELEPORT_RESET_DELAY = 0.5
+-- Seconds the owner suspends its own send stream after a local teleport.
+local OWNER_TELEPORT_COOLDOWN = 0.5
+-- Seconds a replica stays frozen after receiving a reset, for the same reason
+-- on the receiving end.
+local REMOTE_TELEPORT_COOLDOWN = 0.5
 
 M.loading_map = false
 M.id_map = {}
@@ -61,6 +79,23 @@ end
 -- owner is standing still.
 local SEND_LINEAR_DEADBAND = 0.05
 
+-- Suspend this vehicle's outbound stream and drop everything derived from its
+-- pre-teleport position. Nothing sampled before the jump describes the body
+-- that exists after it.
+local function settle_owner_teleport(vehicle_id, vehicle, duration)
+  if not M.ownership[vehicle_id] then return false end
+  if not vehicle then return false end
+
+  local cooldown = duration or OWNER_TELEPORT_COOLDOWN
+  owner_teleport_cooldowns[vehicle_id] = math.max(owner_teleport_cooldowns[vehicle_id] or 0, cooldown)
+  kisstransform.inactive[vehicle_id] = true
+  kisstransform.local_transforms[vehicle_id] = nil
+  last_position_buffer[vehicle_id] = nil
+
+  kisstransform.queue_kiss_command(vehicle, "kiss_vehicle.post_owner_teleport_settle()")
+  return true
+end
+
 local function zero_small_vec_components(x, y, z, deadband)
   if math.sqrt(x * x + y * y + z * z) < deadband then
     return 0, 0, 0
@@ -84,9 +119,26 @@ local function send_vehicle_update(obj)
   -- from a fresh read: re-reading position and velocity on the graphics frame
   -- would pair a fresh pose with a stale rotation and a stale send_timer.
   local position = t.position
+  local position_vec = vec3(position[1], position[2], position[3])
   local velocity = t.velocity
   local velocity_x, velocity_y, velocity_z = zero_small_vec_components(velocity[1], velocity[2], velocity[3], SEND_LINEAR_DEADBAND)
   local angular_velocity = t.angular_velocity
+
+  -- A position jump greater than TELEPORT_THRESHOLD in one tick is treated as a
+  -- teleport. Arm a debounced ResetVehicle so the remote replica resets at the
+  -- new position once the local physics have settled, and stop sending in the
+  -- meantime: the prediction on the far end cannot make sense of a jump.
+  local vehicle_id = obj:getID()
+  if last_position_buffer[vehicle_id] then
+    local last_pos = last_position_buffer[vehicle_id]
+    local distance = position_vec:distance(vec3(last_pos.x, last_pos.y, last_pos.z))
+    if distance > TELEPORT_THRESHOLD then
+      teleport_reset_timers[vehicle_id] = TELEPORT_RESET_DELAY
+      settle_owner_teleport(vehicle_id, obj)
+      return
+    end
+  end
+  last_position_buffer[vehicle_id] = position_vec
 
   -- Finite-number sanity check. If physics on this client blows up (NaN /
   -- Inf in position / velocity / rotation), dropping the packet is the
@@ -197,6 +249,33 @@ local function send_vehicle_config(vehicle_id)
   end
 end
 
+local function prepare_vehicle_for_sync(vehicle)
+  if not vehicle then return end
+  vehicle:queueLuaCommand("extensions.addModulePath('lua/vehicle/extensions/kiss_mp')")
+  vehicle:queueLuaCommand("extensions.loadModulesInDirectory('lua/vehicle/extensions/kiss_mp')")
+end
+
+-- The vehicle the player is already sitting in when a session starts never
+-- raises onVehicleSpawned, so nothing would ever register it for sync. Retry
+-- until the map and spawn queue have settled enough to claim it.
+local function sync_initial_player_vehicle()
+  if not pending_initial_vehicle_sync then return end
+  if M.loading_map or M.delay_spawns then return end
+
+  local vehicle = be:getPlayerVehicle(0)
+  if not vehicle then return end
+
+  local id = vehicle:getID()
+  if M.ownership[id] or M.server_ids[id] then
+    pending_initial_vehicle_sync = false
+    return
+  end
+
+  prepare_vehicle_for_sync(vehicle)
+  send_vehicle_config(id)
+  pending_initial_vehicle_sync = false
+end
+
 local function send_vehicle_config_inner(id, parts_config, data)
   for k, v in pairs(M.id_map) do
     if v == id and not M.ownership[id] then return end
@@ -290,6 +369,9 @@ local function spawn_vehicle(data)
   
   local spawned = spawn.spawnVehicle(name, options.config, options.pos, options.rot, options)
   if not spawned then return end
+  -- Spawn from the VehicleData origin. raw_transforms.position is COG-space
+  -- and would inject a COG offset if used as the initial refnode position.
+  local fresh = kisstransform.raw_transforms[data.server_id]
   local p = data.position
   local r = data.rotation
   spawned:setPositionRotation(p[1], p[2], p[3], r[1], r[2], r[3], r[4])
@@ -299,8 +381,24 @@ local function spawn_vehicle(data)
   M.id_map[data.server_id] = spawned:getID()
   M.server_ids[spawned:getID()] = data.server_id
   kisstransform.inactive[spawned:getID()] = false
-  --if current_vehicle then be:enterVehicle(0, current_vehicle) end
+  -- The vehicle spawns at its last-known origin, but the authority has moved
+  -- on since. Snap it to the latest received pose so it does not start by
+  -- being dragged there.
+  if fresh and kisstransform.queue_cog_snap then
+    kisstransform.queue_cog_snap(spawned, fresh)
+  end
   spawned:queueLuaCommand("extensions.hook('kissUpdateOwnership', false)")
+end
+
+local function send_reset_vehicle(id)
+  if not network.connection.connected then return end
+  if not M.ownership[id] then return end
+  local vehicle = be:getObjectByID(id)
+  if not vehicle then return end
+  local rotation = quatFromDir(-vehicle:getDirectionVector(), vehicle:getDirectionVectorUp())
+  local position = vec3(vehicle:getPosition())
+  local data = { vehicle_id = id, position = {position.x, position.y, position.z}, rotation = {rotation.x, rotation.y, rotation.z, rotation.w}}
+  network.send_data({ ResetVehicle = data }, true)
 end
 
 local function onUpdate(dt)
@@ -313,6 +411,29 @@ local function onUpdate(dt)
   if meta_timer >= 1 then
     send_vehicle_meta_updates()
     meta_timer = meta_timer - 1
+  end
+
+  if pending_initial_vehicle_sync then
+    initial_vehicle_sync_timer = initial_vehicle_sync_timer + dt
+    if initial_vehicle_sync_timer >= 0.25 then
+      initial_vehicle_sync_timer = 0
+      sync_initial_player_vehicle()
+    end
+  end
+
+  for vid, remaining in pairs(owner_teleport_cooldowns) do
+    remaining = remaining - dt
+    if remaining <= 0 then
+      owner_teleport_cooldowns[vid] = nil
+      local vehicle = be:getObjectByID(vid)
+      if vehicle then
+        kisstransform.inactive[vid] = false
+        kisstransform.queue_kiss_command(vehicle, "kiss_vehicle.post_owner_teleport_settle()")
+        last_position_buffer[vid] = vec3(vehicle:getPosition())
+      end
+    else
+      owner_teleport_cooldowns[vid] = remaining
+    end
   end
 
   local tick_time = (1/network.connection.tickrate)
@@ -348,6 +469,23 @@ local function onUpdate(dt)
     end
     for _, v in pairs(to_remove) do
       M.vehicle_buffer[v] = nil
+    end
+  end
+
+  -- Drive the transform update from here so it runs after this frame's send
+  -- loop, rather than at whatever point the extension hook order happens to
+  -- place it.
+  kisstransform.onUpdate(dt)
+
+  -- Fire debounced teleport resets: once physics have settled after the
+  -- position jump, tell the remote replicas to reset at the new location.
+  for vid, remaining in pairs(teleport_reset_timers) do
+    remaining = remaining - dt
+    if remaining <= 0 then
+      teleport_reset_timers[vid] = nil
+      send_reset_vehicle(vid)
+    else
+      teleport_reset_timers[vid] = remaining
     end
   end
 end
@@ -434,7 +572,17 @@ local function reset_vehicle(data)
   local vehicle = be:getObjectByID(id)
   if not vehicle then return end
   if vehicle then
-    vehicle:reset()
+    -- Drop everything derived from the pre-reset stream: the packet history,
+    -- the ordering state, and the prediction state inside vehicle Lua. Then
+    -- freeze the replica while the owner settles, so the correction loop does
+    -- not start pulling toward a pose that is still resolving.
+    M.packet_gen_buffer[id] = nil
+    M.packet_timer_buffer[id] = nil
+    kisstransform.received_transforms[id] = nil
+    kisstransform.set_teleport_cooldown(id, REMOTE_TELEPORT_COOLDOWN)
+    kisstransform.inactive[id] = true
+
+    vehicle:setActive(0)
     vehicle:setPositionRotation(
       position[1],
       position[2],
@@ -444,6 +592,7 @@ local function reset_vehicle(data)
       rotation[3],
       rotation[4]
     )
+    kisstransform.queue_kiss_command(vehicle, string.format("kiss_motion_controller.post_teleport_cooldown(%f)", REMOTE_TELEPORT_COOLDOWN))
   end
 end
 
@@ -582,9 +731,11 @@ local function onVehicleSpawned(id)
     vehicle:queueLuaCommand("recovery.saveHome()")
     first_vehicle = false
   end
-  vehicle:queueLuaCommand("extensions.addModulePath('lua/vehicle/extensions/kiss_mp')")
-  vehicle:queueLuaCommand("extensions.loadModulesInDirectory('lua/vehicle/extensions/kiss_mp')")
+  prepare_vehicle_for_sync(vehicle)
   send_vehicle_config(id)
+  if vehicle == be:getPlayerVehicle(0) then
+    pending_initial_vehicle_sync = false
+  end
   -- Attempt to workaround a bug from latest beamng update. Also prevents unicycle cloning(Somewhat)
   if vehicle:getJBeamFilename() == "unicycle" then
     for i = 0, be:getObjectCount() do
@@ -598,9 +749,13 @@ end
 
 local function onVehicleDestroyed(id)
   if not network.connection.connected then return end
+  last_position_buffer[id] = nil
+  teleport_reset_timers[id] = nil
+  owner_teleport_cooldowns[id] = nil
   if M.ownership[id] then
     M.id_map[M.ownership[id]] = nil
     M.ownership[id] = nil
+    M.server_ids[id] = nil
     network.send_data(
       {
         RemoveVehicle = id,
@@ -612,20 +767,12 @@ local function onVehicleDestroyed(id)
 end
 
 local function onVehicleResetted(id)
-  if not network.connection.connected then return end
+  -- A local reset is a teleport with a known cause: settle our own physics and
+  -- suspend the stream first, then tell the remotes where we ended up.
   if M.ownership[id] then
-    local vehicle = be:getObjectByID(id)
-    local rotation = quat(vehicle:getRefNodeMatrix():toQuatF())
-    local position = vec3(vehicle:getPosition())
-    local data = { vehicle_id = id, position = {position.x, position.y, position.z}, rotation = {rotation.x, rotation.y, rotation.z, rotation.w}}
-    
-    network.send_data(
-      {
-        ResetVehicle = data,
-      },
-      true
-    )
+    settle_owner_teleport(id, be:getObjectByID(id))
   end
+  send_reset_vehicle(id)
 end
 
 local function onVehicleSwitched(_id, new_id)
@@ -650,8 +797,16 @@ local function onMissionLoaded(mission)
   if not network.connection.connected then return end
   M.id_map = {}
   M.ownership = {}
+  M.server_ids = {}
+  M.packet_gen_buffer = {}
+  M.packet_timer_buffer = {}
+  owner_teleport_cooldowns = {}
   M.loading_map = false
   first_vehicle = true
+  -- The player is already in a vehicle at this point, and it never raises
+  -- onVehicleSpawned. Claim it on the next tick instead.
+  pending_initial_vehicle_sync = true
+  initial_vehicle_sync_timer = 0.25
 end
 
 M.onUpdate = onUpdate
