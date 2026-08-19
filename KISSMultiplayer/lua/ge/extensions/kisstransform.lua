@@ -114,10 +114,16 @@ local function update(dt)
   -- Refresh each vehicle's local transform cache. Only owned vehicles send
   -- this cache over the network, but remote vehicles still need their vehicle
   -- Lua modules loaded before receiver-side correction runs.
+  --
+  -- Restricted to objects KissMP actually manages. The level is full of props
+  -- that are BeamNG objects with vehicle IDs - bollards, cones, debris - and
+  -- loading the sync stack into them runs COG computation, beam-graph
+  -- traversal and the correction loop against structure none of them have.
   for i = 0, be:getObjectCount() do
     local vehicle = be:getObject(i)
     local vid = vehicle and vehicle:getID()
-    if vehicle and (not M.inactive[vid]) then
+    local managed = vid and (vehiclemanager.ownership[vid] or vehiclemanager.server_ids[vid])
+    if vehicle and managed and (not M.inactive[vid]) then
       local owned = vehiclemanager.ownership[vid] ~= nil
       queue_kiss_command(vehicle, "kiss_vehicle.update_transform_info(" .. tostring(owned) .. ")")
     end
