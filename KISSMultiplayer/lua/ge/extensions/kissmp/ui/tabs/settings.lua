@@ -2,9 +2,15 @@ local M = {}
 local imgui = ui_imgui
 
 -- A/B TEST SCAFFOLDING (not for upstream).
-local legacy_sync = imgui.BoolPtr(false)
+--
+-- Created lazily inside draw(): this file is require()d from kissui.lua at its
+-- file scope, which runs before the ui_imgui dependency is resolved. Calling
+-- into imgui at module scope indexes a nil and takes kissui down with it.
+local legacy_sync = nil
 
 local function draw()
+  legacy_sync = legacy_sync or imgui.BoolPtr(false)
+
   imgui.Separator()
   imgui.Text("Sync path (testing)")
   if imgui.Checkbox("Use legacy force-based sync", legacy_sync) then
